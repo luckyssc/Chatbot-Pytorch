@@ -17,7 +17,8 @@ os.makedirs("checkpoints", exist_ok=True)
 parser = argparse.ArgumentParser()
 parser.add_argument('--train', dest='train', action='store_true')
 parser.add_argument('--test', dest='train', action='store_false')
-parser.set_defaults(feature=True)
+parser.set_defaults(train=True)
+parser.add_argument('--test_epoch', type=int, default=6, help="the number of model to test")
 # Train paramater
 parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
 parser.add_argument("--n_epochs", type=int, default=40, help="number of epochs of training")
@@ -124,6 +125,7 @@ def test(model,iterator,criterion,vocab):
             target = target.split('<eos>')[0]
             f.write('q:'+query+'\n')
             f.write('a:'+result+'\n')
+            f.write('\n')
             ft.write(result+'\n')
             fr.write(target+'\n')
         output = output[1:].view(-1, output.shape[-1])
@@ -181,7 +183,7 @@ if __name__ == '__main__':
             print(f'\t Val. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f}')
             torch.save(model.state_dict(), 'checkpoints/model{}.pkl'.format(epoch))
     else:
-        model.load_state_dict(torch.load('checkpoints/model5.pkl'))
+        model.load_state_dict(torch.load('checkpoints/model%d.pkl' % opt.test_epoch))
         vocab = data.get_vocab()
         PAD_IDX = vocab.stoi['<pad>']
         criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)

@@ -1,5 +1,8 @@
 # chatbot
 
+[![requirments](https://img.shields.io/badge/pytorch-1.2.0-blue)](requirments)
+[![requirments](https://img.shields.io/badge/torchtext-0.4.0-green)](requirments)
+
 A base Seq2Seq+Attention chatbot model, using DD(daily dialogue) for dataset. 
 
 ## Content
@@ -52,3 +55,21 @@ python main --test
 
 The results will be generate in results/ folder.
 
+And the example of pred.txt is as follow
+
+```
+q:thank you very much . 
+a:you 're welcome . 
+
+q:ok . thank you . 
+a:you are welcome . 
+
+q:you 're looking great . 
+a:yeah , i 'm not sure 
+
+q:how 's the chicken ? 
+a:i 'm not sure . 
+
+q:one hundred dollars . 
+a:here 's your money . i 
+```
