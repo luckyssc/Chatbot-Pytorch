@@ -183,11 +183,11 @@ class Seq2Seq(nn.Module):
         return outputs
 
 if __name__ == "__main__":
-    src = torch.randint(low=0, high=10, size=(64, 6)).cuda()  # b*s
-    trg = torch.randint(low=0, high=10, size=(64, 6)).cuda()  # b*s
+    src = torch.randint(low=0, high=10, size=(8, 64)).cuda()  # S x B
+    trg = torch.randint(low=0, high=10, size=(9, 64)).cuda()  # S x B
     enc = Encoder(16, 32, 2, 2, 0.5)
     attn = Attention(2, 2, 2)
     dec = Decoder(16, 32, 2, 2, 0.5, attn)
     model = Seq2Seq(enc, dec, torch.device("cuda:0")).cuda()
-    out = model(src, trg, 0.5)
+    out = model(src, trg, 0.5) # B x S x V
     print(out.shape)

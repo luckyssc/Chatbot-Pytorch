@@ -49,7 +49,7 @@ The trained model will save in checkpoints/ folder named "model{n}.pkl" where th
 
 Predict the setences use trained model with test data.
 
-```
+``` 
 python main --test
 ``` 
 

@@ -1,77 +1,272 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Variable
+import copy
 
-class TransformerModel(nn.Module):
+def nopeak_mask(size):
+    np_mask = np.triu(np.ones((1, size, size)),k=1).astype('uint8')
+    np_mask =  Variable(torch.from_numpy(np_mask) == 0)
+    np_mask = np_mask.cuda()
+    return np_mask
 
-    def __init__(self, input_dim, output_dim, emb_dim, nhead, nhid, nlayers, dropout=0.5):
-        super(TransformerModel, self).__init__()
-        from torch.nn import TransformerEncoder, TransformerEncoderLayer
-        from torch.nn import TransformerDecoder, TransformerDecoderLayer
+def create_masks(src, trg, src_pad, trg_pad):
+    
+    src_mask = (src != src_pad).unsqueeze(-2)
 
-        self.model_type = 'Transformer'
-        self.src_mask = None
-        self.trg_mask = None
+    if trg is not None:
+        trg_mask = (trg != trg_pad).unsqueeze(-2)
+        size = trg.size(1) # get seq_len for matrix
+        np_mask = nopeak_mask(size)
+        np_mask.cuda()
+        trg_mask = trg_mask & np_mask
+        
+    else:
+        trg_mask = None
+    return src_mask, trg_mask
 
-        self.pos_encoder = PositionalEncoding(emb_dim, dropout)
-        encoder_layers = TransformerEncoderLayer(emb_dim, nhead, nhid, dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
-
-        self.pos_decoder = PositionalEncoding(emb_dim, dropout)
-        decoder_layers = TransformerDecoderLayer(emb_dim, nhead, nhid, dropout)
-        self.transformer_encoder = TransformerDecoder(decoder_layers, nlayers)
-
-
-        self.encoder = nn.Embedding(input_dim, emb_dim)
-        self.emb_dim = emb_dim
-        self.decoder = nn.Linear(emb_dim, input_dim)
-
-        self.init_weights()
-
-    def _generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-
-    def init_weights(self):
-        initrange = 0.1
-        self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.decoder.bias.data.zero_()
-        self.decoder.weight.data.uniform_(-initrange, initrange)
-
-    def forward(self, src):
-        if self.src_mask is None or self.src_mask.size(0) != len(src):
-            device = src.device
-            mask = self._generate_square_subsequent_mask(len(src)).to(device)
-            self.src_mask = mask
-
-        src = self.encoder(src) * math.sqrt(self.emb_dim)
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, self.src_mask)
-        output = self.decoder(output)
-        return F.log_softmax(output, dim=-1)
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
+class Embedder(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super().__init__()
+        self.d_model = d_model
+        self.embed = nn.Embedding(vocab_size, d_model)
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        return self.embed(x)
+
+class PositionalEncoder(nn.Module):
+    def __init__(self, d_model, max_seq_len = 300, dropout = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(dropout)
+        # create constant 'pe' matrix with values dependant on 
+        # pos and i
+        pe = torch.zeros(max_seq_len, d_model)
+        for pos in range(max_seq_len):
+            for i in range(0, d_model, 2):
+                pe[pos, i] = \
+                math.sin(pos / (10000 ** ((2 * i)/d_model)))
+                pe[pos, i + 1] = \
+                math.cos(pos / (10000 ** ((2 * (i + 1))/d_model)))
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+ 
+    
+    def forward(self, x):
+        # make embeddings relatively larger
+        x = x * math.sqrt(self.d_model)
+        #add constant to embedding
+        seq_len = x.size(1)
+        pe = Variable(self.pe[:,:seq_len], requires_grad=False)
+        if x.is_cuda:
+            pe.cuda()
+        x = x + pe
         return self.dropout(x)
 
+class Norm(nn.Module):
+    def __init__(self, d_model, eps = 1e-6):
+        super().__init__()
+    
+        self.size = d_model
+        
+        # create two learnable parameters to calibrate normalisation
+        self.alpha = nn.Parameter(torch.ones(self.size))
+        self.bias = nn.Parameter(torch.zeros(self.size))
+        
+        self.eps = eps
+    
+    def forward(self, x):
+        norm = self.alpha * (x - x.mean(dim=-1, keepdim=True)) \
+        / (x.std(dim=-1, keepdim=True) + self.eps) + self.bias
+        return norm
+
+def attention(q, k, v, d_k, mask=None, dropout=None):
+    
+    scores = torch.matmul(q, k.transpose(-2, -1)) /  math.sqrt(d_k)
+    
+    if mask is not None:
+        mask = mask.unsqueeze(1)
+        scores = scores.masked_fill(mask == 0, -1e9)
+    
+    scores = F.softmax(scores, dim=-1)
+    
+    if dropout is not None:
+        scores = dropout(scores)
+        
+    output = torch.matmul(scores, v)
+    return output
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, heads, d_model, dropout = 0.1):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.d_k = d_model // heads
+        self.h = heads
+        
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(d_model, d_model)
+    
+    def forward(self, q, k, v, mask=None):
+        
+        bs = q.size(0)
+        
+        # perform linear operation and split into N heads
+        k = self.k_linear(k).view(bs, -1, self.h, self.d_k)
+        q = self.q_linear(q).view(bs, -1, self.h, self.d_k)
+        v = self.v_linear(v).view(bs, -1, self.h, self.d_k)
+        
+        # transpose to get dimensions bs * N * sl * d_model
+        k = k.transpose(1,2)
+        q = q.transpose(1,2)
+        v = v.transpose(1,2)
+        
+
+        # calculate attention using function we will define next
+        scores = attention(q, k, v, self.d_k, mask, self.dropout)
+        # concatenate heads and put through final linear layer
+        concat = scores.transpose(1,2).contiguous()\
+        .view(bs, -1, self.d_model)
+        output = self.out(concat)
+    
+        return output
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff=2048, dropout = 0.1):
+        super().__init__() 
+    
+        # We set d_ff as a default to 2048
+        self.linear_1 = nn.Linear(d_model, d_ff)
+        self.dropout = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(d_ff, d_model)
+    
+    def forward(self, x):
+        x = self.dropout(F.relu(self.linear_1(x)))
+        x = self.linear_2(x)
+        return x
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, heads, dropout=0.1):
+        super().__init__()
+        self.norm_1 = Norm(d_model)
+        self.norm_2 = Norm(d_model)
+        self.attn = MultiHeadAttention(heads, d_model, dropout=dropout)
+        self.ff = FeedForward(d_model, dropout=dropout)
+        self.dropout_1 = nn.Dropout(dropout)
+        self.dropout_2 = nn.Dropout(dropout)
+        
+    def forward(self, x, mask):
+        x2 = self.norm_1(x)
+        x = x + self.dropout_1(self.attn(x2,x2,x2,mask))
+        x2 = self.norm_2(x)
+        x = x + self.dropout_2(self.ff(x2))
+        return x
+    
+# build a decoder layer with two multi-head attention layers and
+# one feed-forward layer
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, heads, dropout=0.1):
+        super().__init__()
+        self.norm_1 = Norm(d_model)
+        self.norm_2 = Norm(d_model)
+        self.norm_3 = Norm(d_model)
+        
+        self.dropout_1 = nn.Dropout(dropout)
+        self.dropout_2 = nn.Dropout(dropout)
+        self.dropout_3 = nn.Dropout(dropout)
+        
+        self.attn_1 = MultiHeadAttention(heads, d_model, dropout=dropout)
+        self.attn_2 = MultiHeadAttention(heads, d_model, dropout=dropout)
+        self.ff = FeedForward(d_model, dropout=dropout)
+
+    def forward(self, x, e_outputs, src_mask, trg_mask):
+        x2 = self.norm_1(x)
+        x = x + self.dropout_1(self.attn_1(x2, x2, x2, trg_mask))
+        x2 = self.norm_2(x)
+        x = x + self.dropout_2(self.attn_2(x2, e_outputs, e_outputs, \
+        src_mask))
+        x2 = self.norm_3(x)
+        x = x + self.dropout_3(self.ff(x2))
+        return x
+
+def get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, d_model, N, heads, dropout):
+        super().__init__()
+        self.N = N
+        self.embed = Embedder(vocab_size, d_model)
+        self.pe = PositionalEncoder(d_model, dropout=dropout)
+        self.layers = get_clones(EncoderLayer(d_model, heads, dropout), N)
+        self.norm = Norm(d_model)
+    def forward(self, src, mask):
+        x = self.embed(src)
+        x = self.pe(x)
+        for i in range(self.N):
+            x = self.layers[i](x, mask)
+        return self.norm(x)
+    
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, d_model, N, heads, dropout):
+        super().__init__()
+        self.N = N
+        self.embed = Embedder(vocab_size, d_model)
+        self.pe = PositionalEncoder(d_model, dropout=dropout)
+        self.layers = get_clones(DecoderLayer(d_model, heads, dropout), N)
+        self.norm = Norm(d_model)
+    def forward(self, trg, e_outputs, src_mask, trg_mask):
+        x = self.embed(trg)
+        x = self.pe(x)
+        for i in range(self.N):
+            x = self.layers[i](x, e_outputs, src_mask, trg_mask)
+        return self.norm(x)
+
+class Transformer(nn.Module):
+    def __init__(self, src_vocab, trg_vocab, d_model, N, heads, dropout):
+        super().__init__()
+        self.encoder = Encoder(src_vocab, d_model, N, heads, dropout)
+        self.decoder = Decoder(trg_vocab, d_model, N, heads, dropout)
+        self.out = nn.Linear(d_model, trg_vocab)
+    def forward(self, src, trg, src_mask, trg_mask):
+        e_outputs = self.encoder(src, src_mask)
+        d_output = self.decoder(trg, e_outputs, src_mask, trg_mask)
+        output = self.out(d_output)
+        return output
+
+def get_model(opt, src_vocab, trg_vocab):
+    
+    assert opt.d_model % opt.heads == 0
+    assert opt.dropout < 1
+
+    model = Transformer(src_vocab, trg_vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout)
+       
+    if opt.load_weights is not None:
+        print("loading pretrained weights...")
+        model.load_state_dict(torch.load(f'{opt.load_weights}/model_weights'))
+    else:
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p) 
+    
+    if opt.device == 0:
+        model = model.cuda()
+    
+    return model
+
+
 if __name__ == "__main__":
-    src = torch.randint(low=0, high=10, size=(64, 6)).cuda()  # b*s
-    model = TransformerModel(16, 16, 32, 2, 1, 1).cuda()
-    output = model(src)
+    src = torch.randint(low=0, high=10, size=(64, 6)).cuda()  # B x S
+    trg = torch.randint(low=0, high=10, size=(64, 5)).cuda()
+    trg_input = trg[:, :-1]
+    model = Transformer(16, 16, 32, 2, 1, 0.5).cuda()
+    src_mask, trg_mask = create_masks(src, trg_input, 0, 0)
+    output = model(src, trg_input, src_mask, trg_mask) # B x S x V
     print(output.shape)
+    print(src_mask.shape)
+    print(trg_mask.shape)

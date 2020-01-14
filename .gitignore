@@ -19,3 +19,5 @@ data/data/.ipynb_checkpoints/test-checkpoint.enc
 runs/*
 checkpoints/*
 results/*
+models/__pycache__/test.cpython-36.pyc
+.vscode/launch.json
